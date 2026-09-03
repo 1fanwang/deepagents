@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.0.7](https://github.com/langchain-ai/deepagents/compare/deepagents-talon==0.0.6...deepagents-talon==0.0.7) (2026-09-03)
+
+
+### Features
+
+* **talon:** add channel debug logging ([#5983](https://github.com/langchain-ai/deepagents/issues/5983)) ([1c14626](https://github.com/langchain-ai/deepagents/commit/1c14626d068ee5e1724d53dc17927d37987ebe36))
+* **talon:** add Discord channel adapter ([#5992](https://github.com/langchain-ai/deepagents/issues/5992)) ([67c6c17](https://github.com/langchain-ai/deepagents/commit/67c6c17a316c84a6f21eafb95f12e56eedf11e7e))
+* **talon:** add opt-in agent activity logging ([#5984](https://github.com/langchain-ai/deepagents/issues/5984)) ([3a0f68c](https://github.com/langchain-ai/deepagents/commit/3a0f68ccd08166394e02fd736869482be5759f83))
+* **talon:** interrupt active turns for new messages ([#6023](https://github.com/langchain-ai/deepagents/issues/6023)) ([f93752f](https://github.com/langchain-ai/deepagents/commit/f93752f855836b2af358a7c71c35a9f774af58e3))
+* **talon:** keep typing indicator alive during long agent turns ([#5993](https://github.com/langchain-ai/deepagents/issues/5993)) ([e0d0afa](https://github.com/langchain-ai/deepagents/commit/e0d0afa18a3b8209f20c24cfda2ad766e476a102))
+
+
+### Bug Fixes
+
+* **talon:** improve channel reconnect resilience ([#6040](https://github.com/langchain-ai/deepagents/issues/6040)) ([54fe91f](https://github.com/langchain-ai/deepagents/commit/54fe91fd3745e285899961bfe74380c837674164))
+* **talon:** preserve WhatsApp quoted message context ([#6025](https://github.com/langchain-ai/deepagents/issues/6025)) ([03436b3](https://github.com/langchain-ai/deepagents/commit/03436b369c0324498602fe6b7918cf36f3629d76))
+* **talon:** restore WhatsApp bridge compatibility ([#5999](https://github.com/langchain-ai/deepagents/issues/5999)) ([568b398](https://github.com/langchain-ai/deepagents/commit/568b398df9b9f4f3464b4107c0ef9001f530d728))
+* **talon:** restrict WhatsApp replies to self-chat ([#6010](https://github.com/langchain-ai/deepagents/issues/6010)) ([40359ec](https://github.com/langchain-ai/deepagents/commit/40359ec683eaff3a67b39d3f6b3003e70db9ec4d))
+
 ## [0.0.6](https://github.com/langchain-ai/deepagents/compare/deepagents-talon==0.0.5...deepagents-talon==0.0.6) (2026-08-28)
 
 ### Bug Fixes
