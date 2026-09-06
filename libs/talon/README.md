@@ -27,7 +27,27 @@ AGENT_ASSISTANT_ID=local AGENT_MODEL=<provider>:<model-id> uv run deepagents-tal
 
 If `AGENT_MODEL` is unset, Talon starts with the echo runtime. This is useful for checking host lifecycle and channel wiring without provider credentials.
 
-Assistant state lives under `~/.deepagents/<assistant_id>/` by default. The host creates restrictive state directories for the materialized agent manifest, channel sessions, and cron jobs. The default local execution workspace is the current working directory; set `DEEPAGENTS_TALON_WORKSPACE` to use a different directory. The per-invocation graph recursion limit defaults to `500`; set `DEEPAGENTS_TALON_RECURSION_LIMIT` to tune it.
+Assistant state lives under `~/.deepagents/<assistant_id>/` by default. The host creates restrictive state directories for the materialized agent manifest, channel sessions, and cron jobs, and persists conversation checkpoints in `checkpoints.sqlite` so chat history survives restarts. The default local execution workspace is the current working directory; set `DEEPAGENTS_TALON_WORKSPACE` to use a different directory. The per-invocation graph recursion limit defaults to `500`; set `DEEPAGENTS_TALON_RECURSION_LIMIT` to tune it.
+
+## Conversation history
+
+Talon archives channel conversations in `checkpoints.sqlite` without automatic
+expiry. The agent can list, search, and read past sessions in bounded pages,
+restricted to the current channel and chat. History survives context compaction;
+text, tool-call arguments, and distinct message revisions are retained.
+
+- `/new` starts a fresh context while keeping earlier sessions searchable.
+- `/reset-all-history` stops active work, deletes this chat's archived sessions and
+  checkpoints, and starts a fresh context. Other chats are unaffected. Cancellation
+  timeouts leave history intact; deletion failures may leave a partial reset that
+  you can retry.
+
+Reset does not remove cron jobs, memory files, downloaded media, traces, or backups.
+Attachment binaries and archive-tool results are not indexed. Scheduled runs do not
+add conversation history, and existing checkpoints are not backfilled.
+
+The echo runtime and unwrapped custom checkpointers do not support history tools or
+reset. Custom async LangGraph checkpointers can enable history with `ConversationSaver`.
 
 ## Interrupt and Continue
 
@@ -152,9 +172,15 @@ LANGSMITH_PROJECT=deepagents-talon
 
 When enabled, Talon wraps each agent run in a LangSmith tracing context with assistant id, conversation id, trigger metadata, and source message metadata.
 
+## Chat commands
+
+Send `/help` for a brief guide to Talon, its built-in commands (`/new`, `/stop`,
+and `/mcp-reload`), and using MCP configuration and OAuth through chat. Help does
+not interrupt current work or consume a pending approval or sign-in response.
+
 ## MCP Tools
 
-Talon loads MCP servers from one config file. It checks `DEEPAGENTS_TALON_MCP_CONFIG`, then `MCP_CONFIG`, then `~/.deepagents/.mcp.json`. For user-level MCP servers, edit `~/.deepagents/.mcp.json`:
+Talon loads MCP servers from `~/.deepagents/.mcp.json`. Set `DEEPAGENTS_TALON_MCP_CONFIG` to use a different path. For user-level MCP servers, edit the standard file:
 
 ```json
 {
@@ -167,7 +193,31 @@ Talon loads MCP servers from one config file. It checks `DEEPAGENTS_TALON_MCP_CO
 }
 ```
 
-Run `deepagents-talon mcp config` to print the resolved config paths, and `deepagents-talon mcp login <server>` for OAuth-backed servers.
+Set `"auth": "oauth"` on a remote server to enable OAuth. From WhatsApp,
+Telegram, or another interactive channel, ask Talon to authenticate that configured
+server. Talon calls the narrow `authenticate_mcp_server` capability, sends the
+authorization link directly to the originating conversation, and waits for the same
+operator to paste the full callback URL. The authorization link and callback bypass
+the model context and traces. Newly discovered tools are available on the next channel
+turn after login completes.
+
+Run `deepagents-talon mcp config` to print the resolved config path. The terminal-only
+`deepagents-talon mcp login <server>` flow remains available as an alternative.
+
+On Linux/macOS, Talon can manage its MCP configuration through chat using
+`get_mcp_configuration` (redacted view) and `update_mcp_server` (add, replace, or
+remove one server). Updates require human approval by default and reload before
+the next turn. Set `DEEPAGENTS_TALON_MCP_CONFIG_AUTO_APPROVE=true` in the host
+environment to opt out; explicit tool approval policies still apply.
+
+Use `${ENV_VAR}` references for credentials. Set `DEEPAGENTS_TALON_MCP_CONFIG`
+to keep the file outside the workspace. These tools do not sandbox Talon's local
+shell backend; deployments must enforce filesystem isolation separately.
+
+After editing the configuration manually, send `/mcp-reload` through an authorized channel to
+reload it without restarting Talon. The agent can also call
+`reload_mcp_configuration` autonomously; that schedules the same reload before the
+next agent turn.
 
 Fleet zip exports can be materialized into a Talon-local agent directory before
 starting the host:
@@ -192,54 +242,80 @@ imports into `~/.deepagents/crowbar/`. Pass `--assistant-id <id>` to select a
 different assistant for the import, or `--target-dir <dir>` to write all
 imported files under an explicit directory.
 
-The importer writes Fleet prompts, skills, and subagent prompts. Fleet
-`tools.json` is read only as import input and is not copied into the Talon agent
-directory. Fleet `config.json` is ignored. Talon does not support the old Fleet
-direct-run startup path or its environment variables; import the zip first, then
-run Talon against the materialized local assistant.
+The importer writes Fleet prompts, skills, and subagent prompts. Talon loads local
+subagents from `agents/<name>/AGENTS.md` using dcode's YAML frontmatter format:
+`description` is required, `name` defaults to the directory name, and `model` is
+optional. Local subagents use fork mode so they inherit the current conversation and
+runtime policy; Talon also provides the standard `general-purpose` subagent unless the
+assistant defines one. Fleet `tools.json` and `config.json` are ignored and are not
+copied into the Talon agent directory. Talon does not support the old Fleet direct-run
+startup path or its environment variables; import the zip first, then run Talon against
+the materialized local assistant.
 
-When Fleet MCP tools are present, the importer writes `.mcp.json` in the target
-agent directory. This is the runtime MCP config loaded by Talon and contains the
-sanitized OAuth server entries from the Fleet export. The importer also writes
-`.mcp.json.setup` as a human-readable setup handoff for the operator:
+## Background Subagents
 
-```json
-{
-  "mcpServers": {
-    "fleet-tools": {
-      "type": "http",
-      "url": "https://tools.example.com/mcp",
-      "auth": "oauth",
-      "allowedTools": ["github_get_file", "github_create_pull_request"]
-    }
-  }
-}
-```
+Talon loads local `agents/<name>/AGENTS.md` definitions and remote
+`[async_subagents]` configuration at startup. After adding, editing, or deleting
+definitions, the main agent can call `reload_subagent_configuration` to apply the
+changes on subsequent turns. Ordinary turns reuse the loaded definitions. Invalid
+edits retain the last valid configuration; running subagents keep their original
+configuration.
 
-For non-OAuth servers or local edits, keep credentials in environment variables
-or another local secret source rather than in committed files:
+`task` launches local subagents and `start_async_task` launches remote subagents.
+Both return immediately. The user can continue chatting while the main agent uses
+`list_subagents` to inspect work and `cancel_subagent` to cancel it. When work
+finishes, its result is passed to the main agent for processing on the next idle
+turn, then the main agent replies to the channel.
 
-```json
-{
-  "mcpServers": {
-    "internal-tools": {
-      "command": "internal-mcp-server",
-      "args": ["--token-env", "INTERNAL_MCP_TOKEN"]
-    }
-  }
-}
-```
+Workers and pending results live only in memory and are discarded on restart.
+`/stop` and `/new` cancel all subagents belonging to that conversation; ordinary
+messages interrupt only the main turn. Shutdown cancels all workers. Local tool
+approval policy still applies; a child needing approval reports that it could not
+complete the action. Remote runs cancel when their stream disconnects.
 
-If the Fleet export contains interrupt-enabled tools, the import summary prints
-the recommended `DEEPAGENTS_TALON_INTERRUPT_ON_TOOLS` value. Set that value when
-starting Talon so those tools continue to require channel approval:
+Talon allows four simultaneous subagents, retains at most 128 unprocessed jobs,
+and limits each run to one hour. Completed results are capped at 64,000 characters.
 
-```bash
-DEEPAGENTS_TALON_INTERRUPT_ON_TOOLS=github_create_pull_request,github_update_file \
-AGENT_ASSISTANT_ID=local \
-AGENT_MODEL=<provider>:<model-id> \
-deepagents-talon --telegram
-```
+## Cron Schedules
+
+`create_job` and `edit_job` accept four schedule forms:
+
+| Form | Kind | Example |
+| --- | --- | --- |
+| `in <N>{m,h}` | one-shot | `in 30m` |
+| `every <N>{m,h}` | recurring | `every 6h` |
+| `at <YYYY-MM-DD> <HH:MM> <tz>` | one-shot | `at 2026-09-04 13:30 America/New_York` |
+| `daily at <HH:MM> <tz>` | recurring | `daily at 08:00 America/New_York` |
+
+The wall-clock forms require an explicit IANA timezone name; there is no default
+zone, and legacy POSIX aliases (`EST5EDT`) and bare UTC offsets (`+02:00`) are
+rejected because they cannot express a region's future daylight-saving rules.
+
+The agent gets that zone name from the `current_time` tool, which is always
+available and reports the current date, time, and IANA timezone. Called with no
+argument it uses the host's local zone; pass a zone name to read the clock
+elsewhere. Its `timezone` value goes straight into a schedule string. When the
+host zone name cannot be determined the tool still reports the correct local
+time and UTC offset, but returns `timezone: null` and a note to ask the user
+rather than guessing.
+
+The timezone is stored on the job and pinned. `daily at 08:00 America/New_York`
+fires at 08:00 New York wall-clock time no matter where the host is or which
+side of a daylight-saving transition the run falls on — the next run is rebuilt
+from the local date each time rather than advanced by 24 hours. Two edge cases
+resolve deterministically:
+
+- A local time skipped by a spring-forward transition snaps forward to the first
+  minute that exists, so `daily at 02:30` fires at 03:00 local on that day
+  rather than being skipped.
+- An ambiguous local time repeated by a fall-back transition resolves to its
+  earlier occurrence, so the job fires once.
+
+Interval schedules stay phase-locked to their previous run, so a late scheduler
+tick does not shift an `every 15m` job off its cadence. A one-shot `at` schedule
+that has already passed is rejected at create and edit time with the resolved
+instant in the error message. Because the scheduler ticks every 60 seconds, a
+run lands within the minute it is due, not on the exact second.
 
 ## Cron Observability
 
