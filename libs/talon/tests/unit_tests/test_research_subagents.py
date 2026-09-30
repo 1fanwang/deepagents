@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+from typing import TYPE_CHECKING
 
 import pytest
 from langchain.agents import create_agent
@@ -10,11 +11,26 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool, tool
+from mcp.shared.exceptions import MCPError
 from pydantic import PrivateAttr
 
+from deepagents_talon.authorization import (
+    CallbackURLRequested,
+    current_authorization_attempt,
+    current_authorization_handler,
+    current_authorization_invocation,
+)
 from deepagents_talon.interfaces import AgentRequest
+from deepagents_talon.mcp_auth import _channel_handlers
+from deepagents_talon.mcp_middleware import MCP_TOOL_METADATA_KEY
 from deepagents_talon.runtime import DeepAgentRuntime
+from deepagents_talon.tool_approvals import ToolApprovalStore
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from deepagents_talon.authorization import AuthorizationEvent
 
 
 class ToolModel(FakeMessagesListChatModel):
@@ -60,6 +76,25 @@ def _runtime(root, monkeypatch, parent, child, **kwargs: object):
         skills=(),
         **{"include_web_tools": False, "memory": (), **kwargs},
     )
+
+
+async def test_custom_help_tool_remains_attachable_without_builtin(tmp_path, monkeypatch) -> None:
+    _write_agent(tmp_path, "[ask_for_help]")
+
+    @tool
+    def ask_for_help(question: str) -> str:
+        """Answer a local question."""
+        return question
+
+    model = ToolModel(responses=[AIMessage(content="done")])
+    runtime = _runtime(tmp_path, monkeypatch, model, model, tools=[ask_for_help])
+    await runtime.start()
+    try:
+        inventory = await _inventory(runtime)
+        researcher = next(agent for agent in inventory["agents"] if agent["name"] == "researcher")
+        assert researcher["tools"] == ["ask_for_help"]
+    finally:
+        await runtime.stop()
 
 
 @pytest.mark.parametrize("background", [False, True])
@@ -146,7 +181,7 @@ async def test_research_boundaries(tmp_path, monkeypatch, background, name, atta
         assert {message.name for message in denied} == (
             {call["name"] for call in forbidden} if attached else set()
         )
-        inventory = runtime._graph.nodes["tools"].bound.tools_by_name["get_agent_tools"].invoke({})
+        inventory = await _inventory(runtime)
         agent = next(item for item in inventory["agents"] if item["name"] == name)
         if name == "prepared":
             assert "read_file" in agent["selectable_tools"]
@@ -194,8 +229,84 @@ async def test_explicit_shell_access(tmp_path, monkeypatch, name):
         await runtime.stop()
 
 
-def _inventory(runtime):
-    return runtime._graph.nodes["tools"].bound.tools_by_name["get_agent_tools"].invoke({})
+async def _inventory(runtime):
+    return await runtime._graph.nodes["tools"].bound.tools_by_name["get_agent_tools"].ainvoke({})
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+async def test_local_subagents_retain_mcp_protections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, dynamic: bool, background: bool, fail: bool
+) -> None:
+    _write_agent(tmp_path, "[]" if dynamic else "[remote_search]")
+    received: list[tuple[str, str]] = []
+
+    async def search(query: str, optional: str = "default") -> str:
+        received.append((query, optional))
+        assert current_authorization_invocation() == "remote_search"
+        assert current_authorization_attempt() is not None
+        if fail:
+            raise MCPError(-32602, "Invalid query", data={"private": "hidden-error-data"})
+        if background:
+            assert current_authorization_handler() is None
+        else:
+            redirect, callback = _channel_handlers("remote", "http://localhost:3000/callback")
+            await redirect("https://auth.example/authorize")
+            assert (await callback()).code == "example-code"
+        return "found"
+
+    async def authorize(event: AuthorizationEvent) -> str | None:
+        assert event.binding.invocation_id == "remote_search"
+        if isinstance(event, CallbackURLRequested):
+            return "http://localhost:3000/callback?code=example-code&state=example-state"
+        return None
+
+    remote = StructuredTool.from_function(
+        coroutine=search,
+        description="Search",
+        name="remote_search",
+        metadata={MCP_TOOL_METADATA_KEY: True},
+        args_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "optional": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
+    child = ToolModel(
+        responses=[
+            AIMessage(content="", tool_calls=[_call("remote_search", query="", optional="")]),
+            AIMessage(content="Research complete"),
+        ]
+    )
+    launch = {"tools": ["remote_search"]} if dynamic else {}
+    parent = ToolModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _call("task", subagent_type="researcher", description="Research", **launch)
+                ],
+            ),
+            AIMessage(content="Done"),
+        ]
+    )
+    runtime = _runtime(tmp_path, monkeypatch, parent, child, tools=[remote], env={})
+    if not background:
+        monkeypatch.setattr(runtime.background, "configured", lambda _: AgentMiddleware())
+    await runtime.start()
+    try:
+        await runtime.invoke(AgentRequest("chat", "Research", authorization_handler=authorize))
+        await asyncio.gather(*(job.worker for job in runtime.background._jobs.values()))
+        assert received == [("", "default")]
+        message = child._seen[-1][-1]
+        assert message.status == ("error" if fail else "success")
+        assert message.content == ("MCP protocol error -32602: Invalid query" if fail else "found")
+        assert "hidden-error-data" not in str(child._seen)
+        assert current_authorization_invocation() is None
+        assert current_authorization_attempt() is None
+    finally:
+        await runtime.stop()
 
 
 @pytest.mark.parametrize("configured", [False, True])
@@ -227,7 +338,7 @@ async def test_no_implicit_general_purpose_agent(tmp_path, monkeypatch, configur
     try:
         tools = runtime._graph.nodes["tools"].bound.tools_by_name
         assert ("task" in tools) == configured
-        assert {agent["name"] for agent in _inventory(runtime)["agents"]} == (
+        assert {agent["name"] for agent in (await _inventory(runtime))["agents"]} == (
             {"main", "researcher"} if configured else {"main"}
         )
         if configured:
@@ -337,13 +448,16 @@ async def test_named_task_adds_tools_without_changing_defaults(tmp_path, monkeyp
             AIMessage(content="Delegated"),
         ]
     )
+    store = ToolApprovalStore(tmp_path / "tools.json")
+    snapshot = store.ensure()
+    store.update({"second": protected}, snapshot.revision)
     runtime = _runtime(
         tmp_path,
         monkeypatch,
         parent,
         child,
         tools=[first, second],
-        interrupt_on={"second": protected},
+        approval_store=store,
     )
     await runtime.start()
     try:
@@ -360,9 +474,9 @@ async def test_named_task_adds_tools_without_changing_defaults(tmp_path, monkeyp
         assert effects == (["first", "first"] if protected else ["first", "second", "first"])
         assert child._tools[-1] == ["first"]
         assert path.read_text() == original
-        assert next(item for item in _inventory(runtime)["agents"] if item["name"] == "researcher")[
-            "tools"
-        ] == ["first"]
+        assert next(
+            item for item in (await _inventory(runtime))["agents"] if item["name"] == "researcher"
+        )["tools"] == ["first"]
     finally:
         await runtime.stop()
 
@@ -386,12 +500,12 @@ async def test_attachment_reload_and_invalid_edits_retain_effective_graph(tmp_pa
     try:
         old_view = runtime._graph.nodes["tools"].bound.tools_by_name["get_agent_tools"]
         _write_agent(tmp_path, "[second]")
-        assert _inventory(runtime)["saved_changes_inactive"]
+        assert (await _inventory(runtime))["saved_changes_inactive"]
         assert runtime._attachments[1]["tools"] == ["first"]
         await runtime.reload_subagent_configuration()
-        assert not _inventory(runtime)["saved_changes_inactive"]
+        assert not (await _inventory(runtime))["saved_changes_inactive"]
         assert runtime._attachments[1]["tools"] == ["second"]
-        previous = old_view.invoke({})
+        previous = await old_view.ainvoke({})
         assert previous["current_turn_uses_previous_graph"]
         assert previous["agents"][1]["tools"] == ["first"]
         assert previous["latest_agents"][1]["tools"] == ["second"]
@@ -402,7 +516,92 @@ async def test_attachment_reload_and_invalid_edits_retain_effective_graph(tmp_pa
             assert result["status"] == "failed"
             assert "inactive" in result["message"]
             assert runtime._graph is active
-            assert _inventory(runtime)["saved_changes_inactive"]
+            assert (await _inventory(runtime))["saved_changes_inactive"]
             assert runtime._attachments[1]["tools"] == ["second"]
     finally:
         await runtime.stop()
+
+
+@pytest.mark.parametrize("declared", [False, True])
+async def test_web_tools_follow_the_declared_capability_not_the_agent_name(
+    tmp_path, monkeypatch, declared
+):
+    path = tmp_path / "agents" / "external-research" / "AGENTS.md"
+    path.parent.mkdir(parents=True)
+    frontmatter = "---\ndescription: Public research\ntools: []\n"
+    path.write_text(
+        f"{frontmatter}web: true\n---\nResearch." if declared else f"{frontmatter}---\nResearch."
+    )
+    model = ToolModel(responses=[AIMessage(content="Done")])
+    runtime = _runtime(tmp_path, monkeypatch, model, model, include_web_tools=True)
+    await runtime.start()
+    try:
+        agents = {item["name"]: item["tools"] for item in (await _inventory(runtime))["agents"]}
+        assert agents["external-research"] == (["fetch_url"] if declared else [])
+    finally:
+        await runtime.stop()
+
+
+async def test_declared_web_capability_travels_with_a_renamed_agent(tmp_path, monkeypatch):
+    path = tmp_path / "agents" / "public-digging" / "AGENTS.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\ndescription: Public research\ntools: []\nweb: true\n---\nResearch.")
+    model = ToolModel(responses=[AIMessage(content="Done")])
+    runtime = _runtime(tmp_path, monkeypatch, model, model, include_web_tools=True)
+    await runtime.start()
+    try:
+        agents = {item["name"]: item["tools"] for item in (await _inventory(runtime))["agents"]}
+        assert agents["public-digging"] == ["fetch_url"]
+    finally:
+        await runtime.stop()
+
+
+async def test_per_task_agent_runs_with_an_explicit_config_and_survives_no_messages(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    class Recorder:
+        async def ainvoke(self, payload, config=None):
+            captured["config"] = config
+            captured["payload"] = payload
+            return {"messages": []}
+
+    _write_agent(tmp_path)
+    parent = ToolModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _call(
+                        "task",
+                        subagent_type="researcher",
+                        description="Find evidence",
+                        tools=["current_time"],
+                    )
+                ],
+            ),
+            AIMessage(content="Done"),
+        ]
+    )
+    child = ToolModel(responses=[AIMessage(content="Must not run")])
+    runtime = _runtime(tmp_path, monkeypatch, parent, child)
+    await runtime.start()
+    # Patched after the graph is built so only the per-task compile is intercepted.
+    monkeypatch.setattr(
+        "deepagents_talon.subagents._compile_fresh",
+        lambda *_args, **_kwargs: {
+            "name": "researcher",
+            "description": "x",
+            "runnable": Recorder(),
+        },
+    )
+    try:
+        await runtime.invoke(AgentRequest("chat", "Work"))
+        await asyncio.gather(*(job.worker for job in runtime.background._jobs.values()))
+        results = list(runtime.background.results("chat").values())
+    finally:
+        await runtime.stop()
+
+    assert captured["config"] == {"recursion_limit": 500}
+    assert "Subagent returned no result." in results[0]

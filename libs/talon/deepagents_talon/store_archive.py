@@ -12,13 +12,23 @@ import json
 import unicodedata
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from deepagents_talon.archive import CHUNK_SIZE, _search_page
-from deepagents_talon.store_records import Record, StoreRecords, Write, digest
+from deepagents_talon.archive import CHUNK_SIZE, build_search_page
+from deepagents_talon.history_vectors import HistoryVectorIndex
+from deepagents_talon.store_archive_index import StoreVectorArchive
+from deepagents_talon.store_records import (
+    Record,
+    StoreRecords,
+    Write,
+    digest,
+    number,
+    scope_key,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator, Sequence
@@ -38,16 +48,6 @@ if TYPE_CHECKING:
 _MAX_PAGE_SIZE = 20
 _MAX_SCAN = 500
 _MAX_SEARCH_PAGES = 32
-
-
-def number(record: Record, key: str) -> int:
-    """Read a numeric ordering field from a versioned archive record."""
-    return cast("int", record.get(key, 0))
-
-
-def scope_key(scope: ArchiveScope) -> str:
-    """Encode a trusted chat scope as a backend-independent lookup key."""
-    return "scope:" + digest(scope["talon_history_channel"], scope["talon_history_chat"])
 
 
 def _bounds(after: int, limit: int) -> None:
@@ -70,6 +70,7 @@ def _chunks(messages: Sequence[BaseMessage], timestamp: str) -> Iterator[Record]
         if isinstance(message, AIMessage) and message.tool_calls:
             text += "\nTool calls: " + json.dumps(message.tool_calls, ensure_ascii=False)
         revision = hashlib.sha256(text.encode()).hexdigest()
+        source = message.additional_kwargs.get("talon_history_source", "user")
         for part, start in enumerate(range(0, len(text), CHUNK_SIZE)):
             yield {
                 "message_id": message.id or f"talon-history:{timestamp}:{index}",
@@ -78,6 +79,8 @@ def _chunks(messages: Sequence[BaseMessage], timestamp: str) -> Iterator[Record]
                 "role": message.type,
                 "text": text[start : start + CHUNK_SIZE],
                 "search_text": text if part == 0 else "",
+                "indexable": (isinstance(message, HumanMessage) and source == "user")
+                or (isinstance(message, AIMessage) and source == "delivered"),
             }
 
 
@@ -120,9 +123,6 @@ class StoreConversationArchive:
         self._setup_lock = asyncio.Lock()
         self.vectors = None
         if vector_store is not None:
-            from deepagents_talon.history_vectors import HistoryVectorIndex  # noqa: PLC0415
-            from deepagents_talon.store_archive_index import StoreVectorArchive  # noqa: PLC0415
-
             self.vectors = HistoryVectorIndex(
                 StoreVectorArchive(self),
                 vector_store,
@@ -166,6 +166,35 @@ class StoreConversationArchive:
         """Read the authoritative session registration under the records lock."""
         lookup = await self.records.get("session:" + digest(session_id))
         return await self.records.get(str(number(lookup, "cursor"))) if lookup else None
+
+    async def checkpoint_acknowledged(self, session_id: str, checkpoint_id: str) -> bool:
+        """Check successful archive persistence, independently of checkpoint storage.
+
+        Args:
+            session_id: Trusted session identifier.
+            checkpoint_id: Parent checkpoint whose messages may be skipped.
+        """
+        async with self.records.access():
+            session = await self.session(session_id)
+            return bool(
+                checkpoint_id and session and session.get("archived_checkpoint") == checkpoint_id
+            )
+
+    async def acknowledge_checkpoint(self, session_id: str, checkpoint_id: str) -> None:
+        """Record completion only after all committed messages have been archived.
+
+        Args:
+            session_id: Trusted session identifier.
+            checkpoint_id: Successfully archived checkpoint.
+        """
+        async with self.records.access():
+            session = await self.session(session_id)
+            if session is None or session.get("deleting"):
+                msg = "Cannot acknowledge history for a missing or deleting session"
+                raise ValueError(msg)
+            await self.records.commit(
+                [(str(session["cursor"]), {**session, "archived_checkpoint": checkpoint_id})]
+            )
 
     async def _register(self, scope: ArchiveScope, session_id: str, timestamp: str) -> Record:
         session = await self.session(session_id)
@@ -227,7 +256,9 @@ class StoreConversationArchive:
     ) -> None:
         identifier, revision = str(chunk["message_id"]), str(chunk["revision"])
         key = "dedup:" + digest(session_id, identifier, revision, str(chunk["part"]))
-        if await self.records.get(key) is not None:
+        if existing := await self.records.get(key):
+            if chunk["indexable"]:
+                await self._promote(scope, number(existing, "cursor"))
             return
         session = cast("Record", await self.session(session_id))
         root, scoped = await self.records.root(), await self.records.get(scope_key(scope)) or {}
@@ -250,6 +281,7 @@ class StoreConversationArchive:
             "dedup": key,
             "message": message_key,
             "search_text": chunk["search_text"],
+            "indexable": chunk["indexable"],
         }
         updated = self._summary_update(session, cursor, timestamp, str(chunk["text"]), fresh=fresh)
         writes: list[Write] = [
@@ -263,7 +295,50 @@ class StoreConversationArchive:
         if previous := number(session, "head"):
             prior = cast("Record", await self.records.get(str(previous)))
             writes.append((str(previous), {**prior, "next_session": cursor}))
+        if chunk["role"] == "ai" and chunk["part"] == 0:
+            reply_key = "reply:" + digest(session_id, revision)
+            record["reply_key"] = reply_key
+            writes.append((reply_key, {"message_id": identifier}))
         await self.records.commit(writes)
+
+    async def record_delivery(self, scope: ArchiveScope, session_id: str, text: str) -> None:
+        """Enable semantic indexing only after the host confirms final-reply delivery.
+
+        Args:
+            scope: Trusted channel/chat receiving the reply.
+            session_id: Agent thread producing the reply.
+            text: Text successfully sent to the channel.
+        """
+        revision = hashlib.sha256(text.encode()).hexdigest()
+        async with self.records.access():
+            reply = await self.records.get("reply:" + digest(session_id, revision))
+        identifier = str(reply["message_id"]) if reply else "delivered:" + revision
+        await self.append(
+            scope,
+            session_id,
+            datetime.now(UTC).isoformat(),
+            [
+                AIMessage(
+                    text, id=identifier, additional_kwargs={"talon_history_source": "delivered"}
+                )
+            ],
+        )
+
+    async def _promote(self, scope: ArchiveScope, cursor: int) -> None:
+        record = await self.records.get(str(cursor))
+        if record is None or record.get("indexable"):
+            return
+        root = await self.records.root()
+        scoped = await self.records.get(scope_key(scope)) or {}
+        event = number(root, "last") + 1
+        await self.records.commit(
+            [
+                (str(cursor), {**record, "indexable": True}),
+                (str(event), {"kind": "index-request", "target": cursor}),
+                (scope_key(scope), {**scoped, "vector_head": event}),
+                ("root", {**root, "last": event}),
+            ]
+        )
 
     @staticmethod
     def _summary_update(
@@ -299,7 +374,7 @@ class StoreConversationArchive:
             return None
         return entry
 
-    async def _text_entries(
+    async def text_entries(  # noqa: PLR0913  # Preserve existing arguments when adding partial scans.
         self,
         scope: ArchiveScope,
         *,
@@ -307,7 +382,22 @@ class StoreConversationArchive:
         session_id: str,
         after: int,
         limit: int,
+        partial: bool = False,
     ) -> list[ArchiveEntry]:
+        """Read scoped transcripts by ordering link, for this archive's own adapters.
+
+        Args:
+            scope: Trusted channel and chat identity.
+            query: Literal words to match against complete message revisions.
+            session_id: Read this session chronologically when supplied.
+            after: Previous result cursor.
+            limit: Maximum entries to return.
+            partial: Stop at the scan budget instead of raising; only for ranked
+                candidate generation, never for a page that claims completeness.
+
+        Raises:
+            RuntimeError: The scan budget is exhausted and `partial` is not set.
+        """
         async with self.records.access():
             if session_id:
                 session = await self.session(session_id)
@@ -327,7 +417,7 @@ class StoreConversationArchive:
                     msg = "Conversation archive contains an invalid ordering link"
                     raise RuntimeError(msg)
             hits: list[ArchiveEntry] = []
-            async for _, record in self._retrieval_chain(cursor, link):
+            async for _, record in self._retrieval_chain(cursor, link, partial=partial):
                 entry = await self.visible(record, scope)
                 if (
                     entry is not None
@@ -339,12 +429,20 @@ class StoreConversationArchive:
                         break
             return hits
 
-    async def _retrieval_chain(self, cursor: int, link: str) -> AsyncIterator[tuple[int, Record]]:
+    async def _retrieval_chain(
+        self, cursor: int, link: str, *, partial: bool = False
+    ) -> AsyncIterator[tuple[int, Record]]:
         scanned = 0
         async for identifier, record in self.records.chain(cursor, link):
             yield identifier, record
             scanned += 1
             if scanned == _MAX_SCAN and number(record, link):
+                # Ranked retrieval already scores a bounded candidate pool, so a
+                # truncated scan only narrows it. A page from entries() or
+                # conversations() claims completeness, so truncating one there
+                # would report "no more results" while records remain.
+                if partial:
+                    return
                 msg = (
                     "Conversation history scan limit exceeded (500 records); "
                     "no partial page returned"
@@ -376,7 +474,7 @@ class StoreConversationArchive:
         """
         _bounds(after, limit)
         await self.setup()
-        return await self._text_entries(
+        return await self.text_entries(
             scope, query=query, session_id=session_id, after=after, limit=limit
         )
 
@@ -404,12 +502,12 @@ class StoreConversationArchive:
         continuation = self._pages.get(after) if after else None
         status = "disabled" if query.strip() else "not_requested"
         if after and (continuation is None or continuation[:3] != context):
-            return _search_page([], limit, status, expired=True)
+            return build_search_page([], limit, status, expired=True)
         cursor = continuation[3] if continuation else 0
-        hits = await self._text_entries(
+        hits = await self.text_entries(
             scope, query=query, session_id="", after=cursor, limit=limit + 1
         )
-        page = _search_page(hits, limit, status, expired=bool(after and not hits))
+        page = build_search_page(hits, limit, status, expired=bool(after and not hits))
         if page["has_more"]:
             token = uuid4().hex
             self._pages[token] = (*context, page["results"][-1]["cursor"])
@@ -516,27 +614,40 @@ class StoreConversationArchive:
             return
         root = await self.records.root()
         deletion = number(root, "last") + 1
-        await self.records.commit(
-            [
-                (
-                    str(session["cursor"]),
-                    {**session, "deleting": True, "delete_cursor": session["head"]},
-                ),
-                (
-                    str(deletion),
-                    {"owner": session["cursor"], "previous_deleting": number(root, "deleting")},
-                ),
-                (
-                    "root",
-                    {
-                        **root,
-                        "last": deletion,
-                        "deletions": number(root, "deletions") + 1,
-                        "deleting": deletion,
-                    },
-                ),
-            ]
-        )
+        previous = number(root, "deleting")
+        writes: list[Write] = [
+            (
+                str(session["cursor"]),
+                {
+                    **session,
+                    "deleting": True,
+                    "delete_cursor": session["head"],
+                    "delete_marker": deletion,
+                },
+            ),
+            (
+                str(deletion),
+                # Linked in both directions so a completed marker leaves the chain
+                # without a walk; see `_unlink_deletion`.
+                {
+                    "owner": session["cursor"],
+                    "previous_deleting": previous,
+                    "next_deleting": 0,
+                },
+            ),
+            (
+                "root",
+                {
+                    **root,
+                    "last": deletion,
+                    "deletions": number(root, "deletions") + 1,
+                    "deleting": deletion,
+                },
+            ),
+        ]
+        if previous and (marker := await self.records.get(str(previous))) is not None:
+            writes.append((str(previous), {**marker, "next_deleting": deletion}))
+        await self.records.commit(writes)
 
     async def delete_text(self, session_id: str) -> None:
         """Erase text and dedup records after vector deletion, under the records lock."""
@@ -550,19 +661,56 @@ class StoreConversationArchive:
             links = {key: record[key] for key in ("previous_scope", "previous_session")}
             writes: list[Write] = [(str(cursor), links), (str(session["cursor"]), session)]
             writes.extend((str(record[key]), None) for key in ("dedup", "message"))
+            if key := record.get("vector_content"):
+                writes.append((str(key), None))
+            if key := record.get("reply_key"):
+                writes.append((str(key), None))
             await self.records.commit(writes)
         root = await self.records.root()
+        deletions = number(root, "deletions") - 1
+        markers, deleting = await self._unlink_deletion(session, root, drained=deletions <= 0)
         links = {"previous_scope": session["previous_scope"]}
         scoped = await self.records.get(scope_key(cast("ArchiveScope", session["scope"]))) or {}
         others = await self._other_sessions(scoped, number(session, "cursor"))
         await self.records.commit(
             [
+                *markers,
                 (scope_key(cast("ArchiveScope", session["scope"])), scoped if others else None),
                 (str(session["cursor"]), links),
                 ("session:" + digest(session_id), None),
-                ("root", {**root, "deletions": number(root, "deletions") - 1}),
+                ("root", {**root, "deletions": deletions, "deleting": deleting}),
             ]
         )
+
+    async def _unlink_deletion(
+        self, session: Record, root: Record, *, drained: bool
+    ) -> tuple[list[Write], int]:
+        """Remove a completed deletion marker, returning its writes and the new chain head.
+
+        The chain exists so an interrupted deletion can be found again after a restart.
+        Retaining completed markers would instead record every deletion the assistant
+        has ever performed, and the indexing worker re-walks that chain on every poll
+        for as long as any one deletion is still outstanding. Archives written before
+        markers were linked in both directions have no `delete_marker`; their chain is
+        abandoned wholesale once the last outstanding deletion drains.
+        """
+        deleting = 0 if drained else number(root, "deleting")
+        cursor = number(session, "delete_marker")
+        marker = await self.records.get(str(cursor)) if cursor else None
+        if marker is None:
+            return [], deleting
+        previous, following = number(marker, "previous_deleting"), number(marker, "next_deleting")
+        writes: list[Write] = [(str(cursor), None)]
+        if not following and deleting == cursor:
+            deleting = previous
+        neighbors = (
+            (following, "previous_deleting", previous),
+            (previous, "next_deleting", following),
+        )
+        for neighbor, field, value in neighbors:
+            if neighbor and (record := await self.records.get(str(neighbor))) is not None:
+                writes.append((str(neighbor), {**record, field: value}))
+        return writes, deleting
 
     async def _other_sessions(self, scoped: Record, cursor: int) -> bool:
         async for identifier, record in self.records.chain(

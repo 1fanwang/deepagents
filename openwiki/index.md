@@ -4,7 +4,7 @@ okf_version: "0.2"
 
 # Files
 
-- [Deep Agents Monorepo Quickstart](quickstart.md) - Orient engineers to the independently versioned Deep Agents packages, their package-local Python and uv environments, and the focused wiki guide for each change task.
+- [Engineer Navigation Guide](quickstart.md) - Concise navigation for engineers changing the Deep Agents SDK, dcode, ACP, Talon, partner integrations, or evaluation suite. Routes common work to the architecture, concepts, workflows, operations, and focused testing guidance.
 
 # Directories
 

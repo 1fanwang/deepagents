@@ -37,6 +37,19 @@ def test_skill_installation_and_discovery_preserve_user_changes(tmp_path: Path) 
     assert files[0].read_text() == "Operator customization"
 
 
+def test_safety_skill_installed_without_overwriting_customization(tmp_path: Path) -> None:
+    config = TalonConfig("safety", tmp_path / "assistant")
+    config.ensure_home()
+    runtime = DeepAgentRuntime(model="test:parent", assistant_dir=config.home, env={})
+    skill = Path(runtime._resolve_skills()[0]) / "safety" / "SKILL.md"
+    assert skill.is_file()
+    assert skill.stat().st_mode & 0o777 == 0o600
+    assert skill.read_text().startswith("---\nname: safety\ndescription:")
+    skill.write_text("Operator customization")
+    config.ensure_home()
+    assert skill.read_text() == "Operator customization"
+
+
 @pytest.mark.parametrize("fixture", _FIXTURES, ids=lambda item: item["name"])
 async def test_review_apply_verify_and_rollback(tmp_path, monkeypatch, fixture):
     config = TalonConfig("review", tmp_path / "assistant")
@@ -49,28 +62,28 @@ async def test_review_apply_verify_and_rollback(tmp_path, monkeypatch, fixture):
     untouched = unrelated.read_bytes()
     await runtime.start()
     try:
-        before = _inventory(runtime)
+        before = await _inventory(runtime)
         old_inventory = runtime._attachment_tool(runtime._attachments)
         path.write_text(original.replace("tools: []", f"tools: {json.dumps(fixture['tools'])}"))
-        assert _inventory(runtime)["saved_changes_inactive"]
+        assert (await _inventory(runtime))["saved_changes_inactive"]
         result = await runtime._subagent_reload_tool().ainvoke({})
         assert result["status"] == fixture["status"]
-        after = _inventory(runtime)
+        after = await _inventory(runtime)
         agents = {agent["name"]: agent["tools"] for agent in after["latest_agents"]}
         assert agents["internal-research"] == fixture["expected"]
         assert after["saved_changes_inactive"] == (fixture["status"] == "failed")
-        assert old_inventory.invoke({})["current_turn_uses_previous_graph"] == (
+        assert (await old_inventory.ainvoke({}))["current_turn_uses_previous_graph"] == (
             fixture["status"] == "reloaded"
         )
         assert not {"execute", "write_file", "task"} & set(agents["internal-research"])
         assert "execute" in agents["main"]
         assert unrelated.read_bytes() == untouched
         graph = runtime._graph
-        assert _inventory(runtime) == after
+        assert await _inventory(runtime) == after
         assert runtime._graph is graph
         path.write_text(original)
         await runtime.reload_subagent_configuration()
-        assert _inventory(runtime)["agents"] == before["agents"]
-        assert not _inventory(runtime)["saved_changes_inactive"]
+        assert (await _inventory(runtime))["agents"] == before["agents"]
+        assert not (await _inventory(runtime))["saved_changes_inactive"]
     finally:
         await runtime.stop()
